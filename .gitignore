@@ -1,0 +1,25 @@
+# Build outputs
+app/build/
+build/
+.gradle/
+*.apk
+
+# Large generated assets — recreated by running: bash scripts/build-now.sh
+app/src/main/assets/openclaw-bundle/
+app/src/main/assets/openclaw-bundle.zip
+app/src/main/assets/openclaw-bundle.tar.gz
+app/src/main/assets/openclaw-bundle.tar
+app/src/main/assets/node-arm64
+app/src/main/assets/koffi.node
+app/src/main/jniLibs/
+scripts/.openclaw-bundle/
+scripts/.koffi-ndk/
+
+# Android local config
+local.properties
+*.keystore
+.idea/
+*.iml
+
+# macOS
+.DS_Store

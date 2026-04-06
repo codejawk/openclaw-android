@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenClaw</string>
+    <string name="gateway_notification_channel">OpenClaw Gateway</string>
+    <string name="gateway_notification_title">OpenClaw Gateway Running</string>
+    <string name="gateway_notification_text">AI gateway active on localhost:18789</string>
+</resources>

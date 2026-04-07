@@ -24,6 +24,29 @@ echo "✓ Java:    $(java -version 2>&1 | head -1)"
 echo "✓ SDK:     $ANDROID_HOME"
 echo "✓ NDK:     $NDK_HOME"
 
+# ── libc++_shared.so — required by libnode.so (nodejs-mobile) ────
+echo ""
+echo "==> Copying libc++_shared.so from NDK to jniLibs/arm64-v8a/..."
+
+JNILIBS_DIR="$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a"
+mkdir -p "$JNILIBS_DIR"
+
+LIBCXX="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+if [ -f "$LIBCXX" ]; then
+  cp "$LIBCXX" "$JNILIBS_DIR/libc++_shared.so"
+  echo "  ✓ libc++_shared.so copied ($(du -sh "$JNILIBS_DIR/libc++_shared.so" | cut -f1))"
+else
+  echo "  ⚠️  libc++_shared.so not found at $LIBCXX"
+  echo "     Trying alternate NDK path..."
+  ALT_LIBCXX=$(find "$NDK_HOME" -name "libc++_shared.so" -path "*aarch64*" 2>/dev/null | head -1)
+  if [ -n "$ALT_LIBCXX" ]; then
+    cp "$ALT_LIBCXX" "$JNILIBS_DIR/libc++_shared.so"
+    echo "  ✓ libc++_shared.so copied from $ALT_LIBCXX"
+  else
+    echo "  ❌ libc++_shared.so not found in NDK — libnode.so may fail to load"
+  fi
+fi
+
 # ── koffi cross-compile for Android ARM64 ────────────────────────
 echo ""
 echo "==> Cross-compiling koffi for Android ARM64..."

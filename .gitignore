@@ -11,9 +11,12 @@ app/src/main/assets/openclaw-bundle.tar.gz
 app/src/main/assets/openclaw-bundle.tar
 app/src/main/assets/node-arm64
 app/src/main/assets/koffi.node
-app/src/main/jniLibs/
 scripts/.openclaw-bundle/
 scripts/.koffi-ndk/
+
+# jniLibs: libnode.so and libc++_shared.so are large binaries
+# (copied by build-now.sh from NDK/nodejs-mobile — not version-controlled)
+app/src/main/jniLibs/
 
 # Android local config
 local.properties

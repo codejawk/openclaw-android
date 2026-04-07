@@ -22,6 +22,11 @@ android {
             useSupportLibrary = true
         }
 
+        // Build only for ARM64 (our target device)
+        ndk {
+            abiFilters += setOf("arm64-v8a")
+        }
+
         // Room schema export
         ksp {
             arg("room.schemaLocation", "$projectDir/schemas")
@@ -54,6 +59,13 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     packaging {

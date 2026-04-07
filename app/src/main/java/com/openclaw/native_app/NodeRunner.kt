@@ -4,9 +4,9 @@ import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
+import java.net.InetSocketAddress
+import java.net.Socket
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -15,30 +15,35 @@ enum class NodeState { STOPPED, STARTING, RUNNING, CRASHED }
 /**
  * NodeRunner
  *
- * Manages the lifecycle of the Node.js subprocess that runs the OpenClaw gateway.
- * - Starts node with the correct binary, environment, and entry point
- * - Streams stdout/stderr to logcat
- * - Auto-restarts on crash via watchdog coroutine
- * - Exposes [state] as a StateFlow for UI observation
+ * Manages the lifecycle of the Node.js gateway embedded via JNI (NodeBridge).
+ *
+ * Because libnode.so from nodejs-mobile is an Android Bionic shared library
+ * (ET_DYN), it cannot be exec()-ed directly.  NodeBridge.startNode() loads
+ * it with dlopen and calls node::Start(argc, argv) on a detached pthread.
+ *
+ * Lifecycle:
+ *   start()  → triggers launchAndWait() inside a watchdog coroutine
+ *   stop()   → cancels the watchdog; embedded node keeps running (harmless)
+ *              until the OS kills the process
  */
 @Singleton
 class NodeRunner @Inject constructor(
     private val bootstrap: BootstrapManager
 ) {
     companion object {
-        private const val TAG = "NodeRunner"
-        private const val MAX_RESTART_ATTEMPTS = 5
-        private const val RESTART_DELAY_MS     = 3_000L
+        private const val TAG                = "NodeRunner"
+        private const val MAX_START_WAIT_SEC = 60    // max seconds to wait for gateway port
+        private const val POLL_INTERVAL_MS   = 1_500L
+        private const val HEALTH_INTERVAL_MS = 5_000L
     }
 
     private val _state = MutableStateFlow(NodeState.STOPPED)
     val state: StateFlow<NodeState> = _state
 
-    private var process: Process? = null
     private var watchdogJob: Job? = null
     private var authToken: String = ""
 
-    /** Start the gateway. Idempotent — no-ops if already running. */
+    /** Start the gateway. Idempotent — no-ops if already running or starting. */
     fun start(token: String) {
         if (_state.value == NodeState.RUNNING || _state.value == NodeState.STARTING) return
         authToken = token
@@ -48,14 +53,12 @@ class NodeRunner @Inject constructor(
         }
     }
 
-    /** Stop the gateway gracefully. */
+    /** Stop the gateway (marks it as stopped; node thread keeps running). */
     fun stop() {
         watchdogJob?.cancel()
         watchdogJob = null
-        process?.destroy()
-        process = null
         _state.value = NodeState.STOPPED
-        Log.i(TAG, "Gateway stopped")
+        Log.i(TAG, "Gateway stopped (embedded node will exit with app)")
     }
 
     val isRunning: Boolean get() = _state.value == NodeState.RUNNING
@@ -63,107 +66,136 @@ class NodeRunner @Inject constructor(
     // ──────────────────────────────────────────────────────────────
 
     private suspend fun runWithWatchdog() {
-        var attempts = 0
-        while (attempts < MAX_RESTART_ATTEMPTS) {
-            _state.value = NodeState.STARTING
-            Log.i(TAG, "Starting Node.js gateway (attempt ${attempts + 1})")
-            try {
-                val exitCode = launchAndWait()
-                Log.w(TAG, "Node.js exited with code $exitCode")
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "Node.js launch failed: ${e.message}")
-            }
-            _state.value = NodeState.CRASHED
-            attempts++
-            if (attempts < MAX_RESTART_ATTEMPTS) {
-                Log.i(TAG, "Restarting in ${RESTART_DELAY_MS}ms...")
-                delay(RESTART_DELAY_MS)
-            }
+        _state.value = NodeState.STARTING
+        Log.i(TAG, "Starting Node.js gateway via JNI embedding")
+
+        try {
+            launchAndMonitor()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Node.js gateway error: ${e.message}")
         }
-        _state.value = NodeState.CRASHED
-        Log.e(TAG, "Gateway failed after $MAX_RESTART_ATTEMPTS attempts — giving up")
+
+        if (_state.value != NodeState.STOPPED) {
+            _state.value = NodeState.CRASHED
+            Log.e(TAG, "Node.js gateway exited unexpectedly")
+        }
     }
 
-    private suspend fun launchAndWait(): Int = withContext(Dispatchers.IO) {
-        val nodeBin   = bootstrap.nodeBin
-        val nodeDir   = bootstrap.nodeDir
-        val env       = bootstrap.buildEnvironment(authToken)
-
-        // Entry point: openclaw-bundle/index.js (or server.js)
+    private suspend fun launchAndMonitor() = withContext(Dispatchers.IO) {
+        val nodeBin    = bootstrap.nodeBin        // nativeLibraryDir/libnode.so
+        val nodeDir    = bootstrap.nodeDir        // filesDir/openclaw/
+        val env        = bootstrap.buildEnvironment(authToken)
         val entryPoint = findEntryPoint(nodeDir)
+        val port       = BootstrapManager.GATEWAY_PORT
+
+        Log.i(TAG, "libnode.so : ${nodeBin.absolutePath} (exists=${nodeBin.exists()})")
         Log.i(TAG, "Entry point: ${entryPoint.absolutePath}")
 
-        val cmd = mutableListOf(
-            nodeBin.absolutePath,
+        if (!nodeBin.exists()) {
+            throw IllegalStateException(
+                "libnode.so not found at ${nodeBin.absolutePath}. " +
+                "Ensure jniLibs/arm64-v8a/libnode.so is present and the APK was rebuilt."
+            )
+        }
+        if (!entryPoint.exists()) {
+            throw IllegalStateException(
+                "Node entry point not found: ${entryPoint.absolutePath}. " +
+                "Bootstrap may have failed — try clearing app data."
+            )
+        }
+
+        // argv[0] = program name ("node"), then real arguments
+        val args = listOf(
+            "node",
             "--experimental-specifier-resolution=node",
             entryPoint.absolutePath
         )
 
-        val pb = ProcessBuilder(cmd).apply {
-            directory(nodeDir)
-            environment().putAll(env)
-            redirectErrorStream(false)
+        // Launch — non-blocking; node runs on a detached pthread
+        NodeBridge.startNode(
+            libPath = nodeBin.absolutePath,
+            cwd     = nodeDir.absolutePath,
+            env     = env,
+            args    = args
+        )
+        Log.i(TAG, "NodeBridge.startNode() returned — node thread is running")
+
+        // ── Wait for gateway port to open ──────────────────────────
+        Log.i(TAG, "Waiting for gateway port $port to open…")
+        var portOpen = false
+        repeat(MAX_START_WAIT_SEC) {
+            if (!isActive) return@withContext
+            delay(POLL_INTERVAL_MS)
+            if (isPortOpen(port)) {
+                portOpen = true
+                return@repeat
+            }
         }
 
-        val proc = pb.start()
-        process = proc
+        if (!portOpen) {
+            throw RuntimeException(
+                "Gateway port $port never opened after ${MAX_START_WAIT_SEC}s — " +
+                "check logcat for Node.js errors"
+            )
+        }
+
         _state.value = NodeState.RUNNING
-        Log.i(TAG, "Node.js process started")
+        Log.i(TAG, "Gateway is UP on port $port")
 
-        // Stream stdout
-        CoroutineScope(Dispatchers.IO).launch {
-            BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
-                reader.lineSequence().forEach { line ->
-                    Log.d("$TAG/stdout", line)
-                }
+        // ── Health-check loop ──────────────────────────────────────
+        while (isActive) {
+            delay(HEALTH_INTERVAL_MS)
+            if (!isPortOpen(port) && !NodeBridge.isRunning) {
+                Log.w(TAG, "Gateway health check failed — port $port is down")
+                break
             }
         }
+    }
 
-        // Stream stderr
-        CoroutineScope(Dispatchers.IO).launch {
-            BufferedReader(InputStreamReader(proc.errorStream)).use { reader ->
-                reader.lineSequence().forEach { line ->
-                    Log.w("$TAG/stderr", line)
-                }
+    // ── Helpers ───────────────────────────────────────────────────
+
+    private fun isPortOpen(port: Int, timeoutMs: Int = 1_000): Boolean {
+        return try {
+            Socket().use { sock ->
+                sock.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
+                true
             }
+        } catch (_: Exception) {
+            false
         }
-
-        proc.waitFor()
     }
 
     private fun findEntryPoint(nodeDir: File): File {
-        // Try common entry points
         val candidates = listOf(
+            "dist/index.js",
             "index.js",
             "server.js",
             "bin/openclaw.js",
             "bin/gateway.js",
-            "dist/index.js",
             "lib/index.js"
         )
-        for (candidate in candidates) {
-            val f = File(nodeDir, candidate)
+        for (c in candidates) {
+            val f = File(nodeDir, c)
             if (f.exists()) return f
         }
 
-        // Parse package.json main field
+        // Try package.json "main"
         val pkgJson = File(nodeDir, "package.json")
         if (pkgJson.exists()) {
             try {
                 val json = pkgJson.readText()
-                val mainMatch = Regex("\"main\"\\s*:\\s*\"([^\"]+)\"").find(json)
-                if (mainMatch != null) {
-                    val f = File(nodeDir, mainMatch.groupValues[1])
+                val m = Regex("\"main\"\\s*:\\s*\"([^\"]+)\"").find(json)
+                if (m != null) {
+                    val f = File(nodeDir, m.groupValues[1])
                     if (f.exists()) return f
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Could not parse package.json: ${e.message}")
+                Log.w(TAG, "package.json parse error: ${e.message}")
             }
         }
 
-        // Fallback
         return File(nodeDir, "index.js")
     }
 }
